@@ -26,14 +26,6 @@ namespace Shadowsocks.Util.Sockets
         private Socket _activeSocket;
 
 
-        public WrappedSocket() { }
-
-        public WrappedSocket(Socket socket)
-        {
-            _activeSocket = socket;
-        }
-
-
         public void BeginConnect(EndPoint remoteEP, AsyncCallback callback, object state)
         {
             if (_disposed)
@@ -50,7 +42,10 @@ namespace Shadowsocks.Util.Sockets
             arg.Completed += OnTcpConnectCompleted;
             arg.UserToken = new TcpUserToken(callback, state);
 
-            Socket.ConnectAsync(SocketType.Stream, ProtocolType.Tcp, arg);
+            if(!Socket.ConnectAsync(SocketType.Stream, ProtocolType.Tcp, arg))
+            {
+                OnTcpConnectCompleted(this, arg);
+            }
         }
 
         private class FakeAsyncResult : IAsyncResult

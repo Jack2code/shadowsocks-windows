@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -8,11 +9,14 @@ using System.Threading;
 using System.Web;
 using System.Windows.Forms;
 using Newtonsoft.Json;
-using Shadowsocks.Controller.Service;
+
 using Shadowsocks.Controller.Strategy;
 using Shadowsocks.Model;
 using Shadowsocks.Properties;
 using Shadowsocks.Util;
+using System.Linq;
+using Shadowsocks.Controller.Service;
+using Shadowsocks.Proxy;
 
 namespace Shadowsocks.Controller
 {
@@ -30,7 +34,10 @@ namespace Shadowsocks.Controller
         private PACServer _pacServer;
         private Configuration _config;
         private StrategyManager _strategyManager;
+        private PrivoxyRunner privoxyRunner;
         private GFWListUpdater gfwListUpdater;
+        private readonly ConcurrentDictionary<Server, Sip003Plugin> _pluginsByServer;
+
         public AvailabilityStatistics availabilityStatistics = AvailabilityStatistics.Instance;
         public StatisticsStrategyConfiguration StatisticsConfiguration { get; private set; }
 
@@ -38,25 +45,13 @@ namespace Shadowsocks.Controller
         private long _outboundCounter = 0;
         public long InboundCounter => Interlocked.Read(ref _inboundCounter);
         public long OutboundCounter => Interlocked.Read(ref _outboundCounter);
-        public QueueLast<TrafficPerSecond> traffic;
+        public Queue<TrafficPerSecond> trafficPerSecondQueue;
 
         private bool stopped = false;
-
-        private bool _systemProxyIsDirty = false;
 
         public class PathEventArgs : EventArgs
         {
             public string Path;
-        }
-
-        public class QueueLast<T> : Queue<T>
-        {
-            public T Last { get; private set; }
-            public new void Enqueue(T item)
-            {
-                Last = item;
-                base.Enqueue(item);
-            }
         }
 
         public class TrafficPerSecond
@@ -89,6 +84,7 @@ namespace Shadowsocks.Controller
             _config = Configuration.Load();
             StatisticsConfiguration = StatisticsStrategyConfiguration.Load();
             _strategyManager = new StrategyManager(this);
+            _pluginsByServer = new ConcurrentDictionary<Server, Sip003Plugin>();
             StartReleasingMemory();
             StartTrafficStatistics(61);
         }
@@ -154,6 +150,31 @@ namespace Shadowsocks.Controller
             return GetCurrentServer();
         }
 
+        public EndPoint GetPluginLocalEndPointIfConfigured(Server server)
+        {
+            var plugin = _pluginsByServer.GetOrAdd(server, Sip003Plugin.CreateIfConfigured);
+            if (plugin == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                if (plugin.StartIfNeeded())
+                {
+                    Logging.Info(
+                        $"Started SIP003 plugin for {server.Identifier()} on {plugin.LocalEndPoint} - PID: {plugin.ProcessId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.Error("Failed to start SIP003 plugin: " + ex.Message);
+                throw;
+            }
+
+            return plugin.LocalEndPoint;
+        }
+
         public void SaveServers(List<Server> servers, int localPort)
         {
             _config.configs = servers;
@@ -171,8 +192,13 @@ namespace Shadowsocks.Controller
         {
             try
             {
-                var server = new Server(ssURL);
-                _config.configs.Add(server);
+                if (ssURL.IsNullOrEmpty() || ssURL.IsWhiteSpace()) return false;
+                var servers = Server.GetServers(ssURL);
+                if (servers == null || servers.Count == 0) return false;
+                foreach (var server in servers)
+                {
+                    _config.configs.Add(server);
+                }
                 _config.index = _config.configs.Count - 1;
                 SaveConfig(_config);
                 return true;
@@ -264,11 +290,25 @@ namespace Shadowsocks.Controller
             {
                 _listener.Stop();
             }
+            StopPlugins();
+            if (privoxyRunner != null)
+            {
+                privoxyRunner.Stop();
+            }
             if (_config.enabled)
             {
                 SystemProxy.Update(_config, true, null);
             }
             Encryption.RNG.Close();
+        }
+
+        private void StopPlugins()
+        {
+            foreach (var serverAndPlugin in _pluginsByServer)
+            {
+                serverAndPlugin.Value?.Dispose();
+            }
+            _pluginsByServer.Clear();
         }
 
         public void TouchPACFile()
@@ -298,14 +338,41 @@ namespace Shadowsocks.Controller
         public static string GetQRCode(Server server)
         {
             string tag = string.Empty;
-            string auth = server.auth ? "-auth" : string.Empty;
-            string parts = $"{server.method}{auth}:{server.password}@{server.server}:{server.server_port}";
-            string base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(parts));
-            if(!server.remarks.IsNullOrEmpty())
+            string url = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(server.plugin))
+            {
+                // For backwards compatiblity, if no plugin, use old url format
+                string parts = $"{server.method}:{server.password}@{server.server}:{server.server_port}";
+                string base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(parts));
+                url = base64;
+            }
+            else
+            {
+                // SIP002
+                string parts = $"{server.method}:{server.password}";
+                string base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(parts));
+                string websafeBase64 = base64.Replace('+', '-').Replace('/', '_').TrimEnd('=');
+
+                string pluginPart = server.plugin;
+                if (!string.IsNullOrWhiteSpace(server.plugin_opts))
+                {
+                    pluginPart += ";" + server.plugin_opts;
+                }
+
+                url = string.Format(
+                    "{0}@{1}:{2}/?plugin={3}",
+                    websafeBase64,
+                    HttpUtility.UrlEncode(server.server, Encoding.UTF8),
+                    server.server_port,
+                    HttpUtility.UrlEncode(pluginPart, Encoding.UTF8));
+            }
+
+            if (!server.remarks.IsNullOrEmpty())
             {
                 tag = $"#{HttpUtility.UrlEncode(server.remarks, Encoding.UTF8)}";
             }
-            return $"ss://{base64}{tag}";
+            return $"ss://{url}{tag}";
         }
 
         public void UpdatePACFromGFWList()
@@ -423,11 +490,17 @@ namespace Shadowsocks.Controller
 
         protected void Reload()
         {
+            StopPlugins();
+
             Encryption.RNG.Reload();
             // some logic in configuration updated the config when saving, we need to read it again
             _config = Configuration.Load();
             StatisticsConfiguration = StatisticsStrategyConfiguration.Load();
-            
+
+            if (privoxyRunner == null)
+            {
+                privoxyRunner = new PrivoxyRunner();
+            }
             if (_pacServer == null)
             {
                 _pacServer = new PACServer();
@@ -448,7 +521,11 @@ namespace Shadowsocks.Controller
             {
                 _listener.Stop();
             }
-
+            // don't put PrivoxyRunner.Start() before pacServer.Stop()
+            // or bind will fail when switching bind address from 0.0.0.0 to 127.0.0.1
+            // though UseShellExecute is set to true now
+            // http://stackoverflow.com/questions/10235093/socket-doesnt-close-after-application-exits-if-a-launched-process-is-open
+            privoxyRunner.Stop();
             try
             {
                 var strategy = GetCurrentStrategy();
@@ -457,12 +534,16 @@ namespace Shadowsocks.Controller
                     strategy.ReloadServers();
                 }
 
+                StartPlugins();
+                privoxyRunner.Start(_config);
+
                 TCPRelay tcpRelay = new TCPRelay(this, _config);
                 UDPRelay udpRelay = new UDPRelay(this);
                 List<Listener.IService> services = new List<Listener.IService>();
-                services.Add(_pacServer);
                 services.Add(tcpRelay);
                 services.Add(udpRelay);
+                services.Add(_pacServer);
+                services.Add(new PortForwarder(privoxyRunner.RunningPort));
                 _listener = new Listener(services);
                 _listener.Start(_config);
             }
@@ -491,6 +572,15 @@ namespace Shadowsocks.Controller
             Utils.ReleaseMemory(true);
         }
 
+        private void StartPlugins()
+        {
+            foreach (var server in _config.configs)
+            {
+                // Early start plugin processes
+                GetPluginLocalEndPointIfConfigured(server);
+            }
+        }
+
         protected void SaveConfig(Configuration newConfig)
         {
             Configuration.Save(newConfig);
@@ -499,20 +589,7 @@ namespace Shadowsocks.Controller
 
         private void UpdateSystemProxy()
         {
-            if (_config.enabled)
-            {
-                SystemProxy.Update(_config, false, _pacServer);
-                _systemProxyIsDirty = true;
-            }
-            else
-            {
-                // only switch it off if we have switched it on
-                if (_systemProxyIsDirty)
-                {
-                    SystemProxy.Update(_config, false, _pacServer);
-                    _systemProxyIsDirty = false;
-                }
-            }
+            SystemProxy.Update(_config, false, _pacServer);
         }
 
         private void pacServer_PACFileChanged(object sender, EventArgs e)
@@ -541,10 +618,10 @@ namespace Shadowsocks.Controller
                 UpdatePACFromGFWList();
                 return;
             }
-            List<string> lines = GFWListUpdater.ParseResult(File.ReadAllText(Utils.GetTempPath("gfwlist.txt")));
+            List<string> lines = GFWListUpdater.ParseResult(FileManager.NonExclusiveReadAllText(Utils.GetTempPath("gfwlist.txt")));
             if (File.Exists(PACServer.USER_RULE_FILE))
             {
-                string local = File.ReadAllText(PACServer.USER_RULE_FILE, Encoding.UTF8);
+                string local = FileManager.NonExclusiveReadAllText(PACServer.USER_RULE_FILE, Encoding.UTF8);
                 using (var sr = new StringReader(local))
                 {
                     foreach (var rule in sr.NonWhiteSpaceLines())
@@ -558,7 +635,7 @@ namespace Shadowsocks.Controller
             string abpContent;
             if (File.Exists(PACServer.USER_ABP_FILE))
             {
-                abpContent = File.ReadAllText(PACServer.USER_ABP_FILE, Encoding.UTF8);
+                abpContent = FileManager.NonExclusiveReadAllText(PACServer.USER_ABP_FILE, Encoding.UTF8);
             }
             else
             {
@@ -567,7 +644,7 @@ namespace Shadowsocks.Controller
             abpContent = abpContent.Replace("__RULES__", JsonConvert.SerializeObject(lines, Formatting.Indented));
             if (File.Exists(PACServer.PAC_FILE))
             {
-                string original = File.ReadAllText(PACServer.PAC_FILE, Encoding.UTF8);
+                string original = FileManager.NonExclusiveReadAllText(PACServer.PAC_FILE, Encoding.UTF8);
                 if (original == abpContent)
                 {
                     return;
@@ -605,10 +682,10 @@ namespace Shadowsocks.Controller
 
         private void StartTrafficStatistics(int queueMaxSize)
         {
-            traffic = new QueueLast<TrafficPerSecond>();
+            trafficPerSecondQueue = new Queue<TrafficPerSecond>();
             for (int i = 0; i < queueMaxSize; i++)
             {
-                traffic.Enqueue(new TrafficPerSecond());
+                trafficPerSecondQueue.Enqueue(new TrafficPerSecond());
             }
             _trafficThread = new Thread(new ThreadStart(() => TrafficStatistics(queueMaxSize)));
             _trafficThread.IsBackground = true;
@@ -617,19 +694,20 @@ namespace Shadowsocks.Controller
 
         private void TrafficStatistics(int queueMaxSize)
         {
+            TrafficPerSecond previous, current;
             while (true)
             {
-                TrafficPerSecond previous = traffic.Last;
-                TrafficPerSecond current = new TrafficPerSecond();
+                previous = trafficPerSecondQueue.Last();
+                current = new TrafficPerSecond();
                 
-                var inbound = current.inboundCounter = InboundCounter;
-                var outbound = current.outboundCounter = OutboundCounter;
-                current.inboundIncreasement = inbound - previous.inboundCounter;
-                current.outboundIncreasement = outbound - previous.outboundCounter;
+                current.inboundCounter = InboundCounter;
+                current.outboundCounter = OutboundCounter;
+                current.inboundIncreasement = current.inboundCounter - previous.inboundCounter;
+                current.outboundIncreasement = current.outboundCounter - previous.outboundCounter;
 
-                traffic.Enqueue(current);
-                if (traffic.Count > queueMaxSize)
-                    traffic.Dequeue();
+                trafficPerSecondQueue.Enqueue(current);
+                if (trafficPerSecondQueue.Count > queueMaxSize)
+                    trafficPerSecondQueue.Dequeue();
 
                 TrafficChanged?.Invoke(this, new EventArgs());
 

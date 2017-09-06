@@ -7,6 +7,8 @@ using System.Windows.Input;
 using System.Threading;
 using System.Collections.Generic;
 using Shadowsocks.Controller.Hotkeys;
+using Shadowsocks.Encryption.Stream;
+using Shadowsocks.Model;
 
 namespace test
 {
@@ -70,7 +72,7 @@ namespace test
         {
             RNG.Reload();
             byte[] plain = new byte[16384];
-            byte[] cipher = new byte[plain.Length + 16 + IVEncryptor.ONETIMEAUTH_BYTES + IVEncryptor.AUTH_BYTES];
+            byte[] cipher = new byte[plain.Length + 16];
             byte[] plain2 = new byte[plain.Length + 16];
             int outLen = 0;
             int outLen2 = 0;
@@ -130,8 +132,8 @@ namespace test
                 {
                     IEncryptor encryptor;
                     IEncryptor decryptor;
-                    encryptor = new MbedTLSEncryptor("aes-256-cfb", "barfoo!", false, false);
-                    decryptor = new MbedTLSEncryptor("aes-256-cfb", "barfoo!", false, false);
+                    encryptor = new StreamMbedTLSEncryptor("aes-256-cfb", "barfoo!");
+                    decryptor = new StreamMbedTLSEncryptor("aes-256-cfb", "barfoo!");
                     RunEncryptionRound(encryptor, decryptor);
                 }
             }
@@ -171,8 +173,8 @@ namespace test
                     var random = new Random();
                     IEncryptor encryptor;
                     IEncryptor decryptor;
-                    encryptor = new MbedTLSEncryptor("rc4-md5", "barfoo!", false, false);
-                    decryptor = new MbedTLSEncryptor("rc4-md5", "barfoo!", false, false);
+                    encryptor = new StreamMbedTLSEncryptor("rc4-md5", "barfoo!");
+                    decryptor = new StreamMbedTLSEncryptor("rc4-md5", "barfoo!");
                     RunEncryptionRound(encryptor, decryptor);
                 }
             }
@@ -212,8 +214,8 @@ namespace test
                     var random = new Random();
                     IEncryptor encryptor;
                     IEncryptor decryptor;
-                    encryptor = new SodiumEncryptor("salsa20", "barfoo!", false, false);
-                    decryptor = new SodiumEncryptor("salsa20", "barfoo!", false, false);
+                    encryptor = new StreamSodiumEncryptor("salsa20", "barfoo!");
+                    decryptor = new StreamSodiumEncryptor("salsa20", "barfoo!");
                     RunEncryptionRound(encryptor, decryptor);
                 }
             }
@@ -221,6 +223,137 @@ namespace test
             {
                 encryptionFailed = true;
                 throw;
+            }
+        }
+
+        [TestMethod]
+        public void ParseAndGenerateShadowsocksUrl()
+        {
+            var server = new Server
+            {
+                server = "192.168.100.1",
+                server_port = 8888,
+                password = "test",
+                method = "bf-cfb"
+            };
+            var serverCanonUrl = "ss://YmYtY2ZiOnRlc3RAMTkyLjE2OC4xMDAuMTo4ODg4";
+
+            var serverWithRemark = new Server
+            {
+                server = server.server,
+                server_port = server.server_port,
+                password = server.password,
+                method = server.method,
+                remarks = "example-server"
+            };
+            var serverWithRemarkCanonUrl = "ss://YmYtY2ZiOnRlc3RAMTkyLjE2OC4xMDAuMTo4ODg4#example-server";
+
+            var serverWithPlugin = new Server
+            {
+                server = server.server,
+                server_port = server.server_port,
+                password = server.password,
+                method = server.method,
+                plugin = "obfs-local",
+                plugin_opts = "obfs=http;obfs-host=google.com"
+            };
+            var serverWithPluginCanonUrl =
+                "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888/?plugin=obfs-local%3bobfs%3dhttp%3bobfs-host%3dgoogle.com";
+
+            var serverWithPluginAndRemark = new Server
+            {
+                server = server.server,
+                server_port = server.server_port,
+                password = server.password,
+                method = server.method,
+                plugin = serverWithPlugin.plugin,
+                plugin_opts = serverWithPlugin.plugin_opts,
+                remarks = serverWithRemark.remarks
+            };
+            var serverWithPluginAndRemarkCanonUrl =
+                "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888/?plugin=obfs-local%3bobfs%3dhttp%3bobfs-host%3dgoogle.com#example-server";
+
+            RunParseShadowsocksUrlTest(
+                string.Join(
+                    "\r\n",
+                    serverCanonUrl,
+                    "\r\n",
+                    "ss://YmYtY2ZiOnRlc3RAMTkyLjE2OC4xMDAuMTo4ODg4/",
+                    serverWithRemarkCanonUrl,
+                    "ss://YmYtY2ZiOnRlc3RAMTkyLjE2OC4xMDAuMTo4ODg4/#example-server"),
+                new[]
+                {
+                    server,
+                    server,
+                    serverWithRemark,
+                    serverWithRemark
+                });
+
+            RunParseShadowsocksUrlTest(
+                string.Join(
+                    "\r\n",
+                    "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888",
+                    "\r\n",
+                    "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888/",
+                    "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888#example-server",
+                    "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888/#example-server",
+                    serverWithPluginCanonUrl,
+                    serverWithPluginAndRemarkCanonUrl,
+                    "ss://YmYtY2ZiOnRlc3Q@192.168.100.1:8888/?plugin=obfs-local%3bobfs%3dhttp%3bobfs-host%3dgoogle.com&unsupported=1#example-server"),
+                new[]
+                {
+                    server,
+                    server,
+                    serverWithRemark,
+                    serverWithRemark,
+                    serverWithPlugin,
+                    serverWithPluginAndRemark,
+                    serverWithPluginAndRemark
+                });
+
+            var generateUrlCases = new Dictionary<string, Server>
+            {
+                [serverCanonUrl] = server,
+                [serverWithRemarkCanonUrl] = serverWithRemark,
+                [serverWithPluginCanonUrl] = serverWithPlugin,
+                [serverWithPluginAndRemarkCanonUrl] = serverWithPluginAndRemark
+            };
+            RunGenerateShadowsocksUrlTest(generateUrlCases);
+        }
+
+        private static void RunParseShadowsocksUrlTest(string testCase, IReadOnlyList<Server> expected)
+        {
+            var actual = Server.GetServers(testCase);
+            if (actual.Count != expected.Count)
+            {
+                Assert.Fail("Wrong number of configs. Expected: {0}. Actual: {1}", expected.Count, actual.Count);
+            }
+
+            for (int i = 0; i < expected.Count; i++)
+            {
+                var expectedServer = expected[i];
+                var actualServer = actual[i];
+
+                Assert.AreEqual(expectedServer.server, actualServer.server);
+                Assert.AreEqual(expectedServer.server_port, actualServer.server_port);
+                Assert.AreEqual(expectedServer.password, actualServer.password);
+                Assert.AreEqual(expectedServer.method, actualServer.method);
+                Assert.AreEqual(expectedServer.plugin, actualServer.plugin);
+                Assert.AreEqual(expectedServer.plugin_opts, actualServer.plugin_opts);
+                Assert.AreEqual(expectedServer.remarks, actualServer.remarks);
+                Assert.AreEqual(expectedServer.timeout, actualServer.timeout);
+            }
+        }
+
+        private static void RunGenerateShadowsocksUrlTest(IReadOnlyDictionary<string, Server> testCases)
+        {
+            foreach (var testCase in testCases)
+            {
+                string expected = testCase.Key;
+                Server config = testCase.Value;
+
+                var actual = ShadowsocksController.GetQRCode(config);
+                Assert.AreEqual(expected, actual);
             }
         }
     }

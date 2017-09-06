@@ -1,6 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Web;
 using Shadowsocks.Controller;
 
@@ -9,11 +10,6 @@ namespace Shadowsocks.Model
     [Serializable]
     public class Server
     {
-        public static readonly Regex
-            UrlFinder = new Regex("^(?i)ss://([A-Za-z0-9+-/=_]+)(#(.+))?$", RegexOptions.IgnoreCase),
-            DetailsParser = new Regex("^((?<method>.+?)(?<auth>-auth)??:(?<password>.*)@(?<hostname>.+?)" +
-                                      ":(?<port>\\d+?))$", RegexOptions.IgnoreCase);
-
         private const int DefaultServerTimeoutSec = 5;
         public const int MaxServerTimeoutSec = 20;
 
@@ -21,8 +17,9 @@ namespace Shadowsocks.Model
         public int server_port;
         public string password;
         public string method;
+        public string plugin;
+        public string plugin_opts;
         public string remarks;
-        public bool auth;
         public int timeout;
 
         public override int GetHashCode()
@@ -44,11 +41,10 @@ namespace Shadowsocks.Model
             }
             string serverStr;
             // CheckHostName() won't do a real DNS lookup
-            var hostType = Uri.CheckHostName( server );
-            if ( hostType == UriHostNameType.Unknown ) {
-                throw new FormatException("Invalid Server Address.");
-            }
-            switch ( hostType ) {
+            var hostType = Uri.CheckHostName(server);
+
+            switch (hostType)
+            {
                 case UriHostNameType.IPv6:
                     serverStr = $"[{server}]:{server_port}";
                     break;
@@ -67,27 +63,108 @@ namespace Shadowsocks.Model
             server = "";
             server_port = 8388;
             method = "aes-256-cfb";
+            plugin = "";
+            plugin_opts = "";
             password = "";
             remarks = "";
-            auth = false;
             timeout = DefaultServerTimeoutSec;
         }
 
-        public Server(string ssURL) : this()
+        public static List<Server> GetServers(string ssURL)
         {
-            var match = UrlFinder.Match(ssURL);
-            if (!match.Success) throw new FormatException();
-            var base64 = match.Groups[1].Value;
-            var tag = match.Groups[3].Value;
-            if (!tag.IsNullOrEmpty())
-                remarks = HttpUtility.UrlDecode(tag, Encoding.UTF8);
-            match = DetailsParser.Match(Encoding.UTF8.GetString(Convert.FromBase64String(
-                base64.PadRight(base64.Length + (4 - base64.Length % 4) % 4, '='))));
-            method = match.Groups["method"].Value;
-            auth = match.Groups["auth"].Success;
-            password = match.Groups["password"].Value;
-            server = match.Groups["hostname"].Value;
-            server_port = int.Parse(match.Groups["port"].Value);
+            var serverUrls = ssURL.Split('\r', '\n');
+
+            List<Server> servers = new List<Server>();
+            foreach (string serverUrl in serverUrls)
+            {
+                if (string.IsNullOrWhiteSpace(serverUrl))
+                {
+                    continue;
+                }
+
+                Uri parsedUrl;
+                try
+                {
+                    parsedUrl = new Uri(serverUrl);
+                }
+                catch (UriFormatException)
+                {
+                    continue;
+                }
+
+                Server tmp = new Server
+                {
+                    remarks = parsedUrl.GetComponents(UriComponents.Fragment, UriFormat.Unescaped)
+                };
+
+                string possiblyUnpaddedBase64 = parsedUrl.GetComponents(UriComponents.UserInfo, UriFormat.Unescaped);
+                bool isOldFormatUrl = possiblyUnpaddedBase64.Length == 0;
+                if (isOldFormatUrl)
+                {
+                    int prefixLength = "ss://".Length;
+                    int indexOfHashOrSlash = serverUrl.LastIndexOfAny(
+                        new[] { '/', '#' },
+                        serverUrl.Length - 1,
+                        serverUrl.Length - prefixLength);
+
+                    int substringLength = serverUrl.Length - prefixLength;
+                    if (indexOfHashOrSlash >= 0)
+                    {
+                        substringLength = indexOfHashOrSlash - prefixLength;
+                    }
+
+                    possiblyUnpaddedBase64 = serverUrl.Substring(prefixLength, substringLength).TrimEnd('/');
+                }
+                else
+                {
+                    // Web-safe base64 to normal base64
+                    possiblyUnpaddedBase64 = possiblyUnpaddedBase64.Replace('-', '+').Replace('_', '/');
+                }
+
+                string base64 = possiblyUnpaddedBase64.PadRight(
+                    possiblyUnpaddedBase64.Length + (4 - possiblyUnpaddedBase64.Length % 4) % 4,
+                    '=');
+
+                string innerUserInfoOrUrl = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
+                string userInfo;
+                if (isOldFormatUrl)
+                {
+                    Uri innerUrl = new Uri("inner://" + innerUserInfoOrUrl);
+                    userInfo = innerUrl.GetComponents(UriComponents.UserInfo, UriFormat.Unescaped);
+                    tmp.server = innerUrl.GetComponents(UriComponents.Host, UriFormat.Unescaped);
+                    tmp.server_port = innerUrl.Port;
+                }
+                else
+                {
+                    userInfo = innerUserInfoOrUrl;
+                    tmp.server = parsedUrl.GetComponents(UriComponents.Host, UriFormat.Unescaped);
+                    tmp.server_port = parsedUrl.Port;
+                }
+
+                string[] userInfoParts = userInfo.Split(new[] { ':' }, 2);
+                if (userInfoParts.Length != 2)
+                {
+                    continue;
+                }
+
+                tmp.method = userInfoParts[0];
+                tmp.password = userInfoParts[1];
+
+                NameValueCollection queryParameters = HttpUtility.ParseQueryString(parsedUrl.Query);
+                string[] pluginParts = HttpUtility.UrlDecode(queryParameters["plugin"] ?? "").Split(new[] { ';' }, 2);
+                if (pluginParts.Length > 0)
+                {
+                    tmp.plugin = pluginParts[0] ?? "";
+                }
+
+                if (pluginParts.Length > 1)
+                {
+                    tmp.plugin_opts = pluginParts[1] ?? "";
+                }
+
+                servers.Add(tmp);
+            }
+            return servers;
         }
 
         public string Identifier()
